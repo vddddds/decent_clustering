@@ -1,0 +1,419 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import logging
+import matplotlib.pyplot as plt
+import scipy.optimize  # For Hungarian algorithm
+import argparse
+from tqdm import tqdm
+import os
+from sklearn.metrics import silhouette_score, normalized_mutual_info_score, adjusted_rand_score, mean_absolute_error, \
+    davies_bouldin_score, calinski_harabasz_score
+from sklearn.neighbors import NearestNeighbors  # To assign agents to predicted clusters
+import pandas as pd  # For displaying metrics nicely
+import multiprocessing as mp
+from sklearn.metrics import davies_bouldin_score, calinski_harabasz_score
+from scipy.stats import entropy
+import pandas as pd
+import numpy as np
+from dataset_generation import BaseAgentsDataset, CompressedSensingGridDataset
+
+
+# ============================================
+# Model Definition
+# ============================================
+class ClusterPredictionModel(nn.Module):
+    """
+    Predicts cluster centroids (cx, cy) and weights (w)
+    from compressed sensing measurements Y˜.
+    """
+
+    def __init__(self, measurement_dim: int, max_clusters: int, hidden_dims: list = [512, 512, 256]):
+        super().__init__()
+        self.measurement_dim = measurement_dim
+        self.max_clusters = max_clusters
+        self.output_dim_per_cluster = 3  # cx, cy, weight
+
+        layers = []
+        input_d = measurement_dim
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(input_d, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.ReLU())
+            input_d = h_dim
+
+        self.feature_extractor = nn.Sequential(*layers)
+        self.output_head = nn.Linear(input_d, max_clusters * self.output_dim_per_cluster)
+
+        self.coord_activation = nn.Sigmoid()
+        self.weight_activation = nn.ReLU()  # Or nn.Softplus()
+
+    def forward(self, y_tilde):
+        features = self.feature_extractor(y_tilde)
+        flat_output = self.output_head(features)
+        output = flat_output.view(-1, self.max_clusters, self.output_dim_per_cluster)
+        pred_coords = self.coord_activation(output[..., 0:2])
+        pred_weights = self.weight_activation(output[..., 2:3])  # keep dim
+        final_output = torch.cat([pred_coords, pred_weights], dim=-1)
+        return final_output  # Shape: (batch_size, max_clusters, 3)
+
+
+# ============================================
+# Loss Function (Hungarian Loss for Clusters)
+# ============================================
+def masked_hungarian_loss(predictions, targets, masks, coord_weight=1.0, weight_weight=0.1):
+    """
+    Computes Hungarian loss between predicted and target clusters, respecting masks.
+    Uses explicit .expand() to ensure identical shapes for loss calculation and avoid warnings.
+    """
+    batch_size = predictions.shape[0]
+    max_k = predictions.shape[1]
+    device = predictions.device
+    #print(predictions)
+    total_loss = 0.0
+    num_valid_samples = 0
+
+    for i in range(batch_size):
+        pred_sample = predictions[i]  # (max_k, 3)
+        target_mask_sample = masks[i].bool()  # (max_k,)
+        valid_targets = targets[i][target_mask_sample]  # (num_valid_targets, 3)
+        num_valid_targets = valid_targets.shape[0]
+        # Use max_k as num_predictions, assuming we always make max_k predictions
+        num_predictions = pred_sample.shape[0]  # Should be max_k
+
+        if num_valid_targets == 0:
+            # No targets to match against, loss is 0 for this sample
+            continue
+        # No need to check num_predictions == 0 if it's always max_k > 0
+
+        # --- Prepare shapes for explicit expansion ---
+        pred_coords_base = pred_sample[..., 0:2].unsqueeze(1)  # (num_pred, 1, 2)
+        valid_targets_coords_base = valid_targets[..., 0:2].unsqueeze(0)  # (1, num_valid, 2)
+
+        pred_weights_base = pred_sample[..., 2].unsqueeze(1)  # (num_pred, 1)
+        valid_targets_weights_base = valid_targets[..., 2].unsqueeze(0)  # (1, num_valid)
+
+        # --- Explicitly expand both tensors to the broadcasted shape ---
+        # Target shape for pairwise comparison: (num_pred, num_valid, Dims)
+        pred_coords_expanded = pred_coords_base.expand(num_predictions, num_valid_targets, 2)
+        target_coords_expanded = valid_targets_coords_base.expand(num_predictions, num_valid_targets, 2)
+
+        pred_weights_expanded = pred_weights_base.expand(num_predictions, num_valid_targets)
+        target_weights_expanded = valid_targets_weights_base.expand(num_predictions, num_valid_targets)
+
+        # --- Compute pairwise cost matrix using identical shapes ---
+        # Calculate coordinate distance (Smooth L1)
+        coord_diff = F.smooth_l1_loss(
+            pred_coords_expanded,
+            target_coords_expanded,
+            reduction='none', beta=0.1  # Or adjust beta as needed
+        ).sum(dim=-1)  # Sum over x and y -> Shape: (num_pred, num_valid)
+
+        # Calculate weight distance (Smooth L1)
+        weight_diff = F.smooth_l1_loss(
+            pred_weights_expanded,
+            target_weights_expanded,
+            reduction='none', beta=1.0  # Or adjust beta as needed
+        )  # Shape: (num_pred, num_valid)
+
+        # Combine costs
+        cost_matrix = (coord_weight * coord_diff) + (weight_weight * weight_diff)
+        # cost_matrix shape: (num_predictions, num_valid_targets)
+
+        # --- Perform Hungarian matching ---
+        cost_matrix_np = cost_matrix.detach().cpu().numpy()
+        try:
+            # Note: Scipy handles non-square matrices correctly for assignment
+            row_ind, col_ind = scipy.optimize.linear_sum_assignment(cost_matrix_np)
+        except ValueError as e:
+            logging.warning(
+                f"Scipy linear_sum_assignment failed: {e}, Cost matrix shape: {cost_matrix_np.shape}. Skipping sample {i}.")
+            continue
+
+        # --- Calculate loss based on matched pairs ---
+        if len(row_ind) > 0:
+            # Use the indices from scipy on the original cost_matrix (with gradients)
+            matched_costs = cost_matrix[row_ind, col_ind]
+            sample_loss = matched_costs.mean()
+            total_loss += sample_loss
+            num_valid_samples += 1
+        # If len(row_ind) == 0 (no matches possible, e.g. num_valid_targets=0), sample_loss remains 0
+
+    # Average loss over samples that had valid targets and successful matching
+    if num_valid_samples > 0:
+        average_loss = total_loss / num_valid_samples
+    else:
+        # If no samples contributed to loss (e.g., all had 0 valid targets or matching failed)
+        # Return 0 loss, but ensure it's a tensor on the correct device with requires_grad=False
+        average_loss = torch.tensor(0.0, device=device, dtype=predictions.dtype)
+
+    return average_loss
+
+
+# ============================================
+# Scheduler Function
+# ============================================
+def get_scheduler(optimizer, warmup_steps=1000, total_steps=10000, final_lr_scale=0.1):
+    """Cosine decay scheduler with warmup."""
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine_decay = 0.5 * (1.0 + np.cos(np.pi * progress))
+        scaled_decay = (1.0 - final_lr_scale) * cosine_decay + final_lr_scale
+        return max(0.0, scaled_decay)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+# ============================================
+# Evaluation Function
+# ============================================
+def evaluate_sample(
+        model, y_tilde_sample, targets_sample, mask_sample,
+        agents_coords, true_agent_cluster_ids, device,
+        coord_weight=1.0, weight_weight=0.1, plot_agents=True,
+        sample_index=None
+):
+    """ Evaluates model predictions for a single sample against ground truth. """
+    model.eval()
+    # --- 1. Get Model Prediction ---
+    with torch.no_grad():
+        y_tilde_batch = y_tilde_sample.unsqueeze(0).to(device)
+        predictions_batch = model(y_tilde_batch)
+        predictions_sample = predictions_batch.squeeze(0).cpu().numpy()
+
+    gt_centroids_all = targets_sample[:, 0:2].cpu().numpy()
+    gt_weights_all = targets_sample[:, 2].cpu().numpy()
+    gt_mask = mask_sample.cpu().numpy() > 0
+    valid_gt_centroids = gt_centroids_all[gt_mask]
+    valid_gt_weights = gt_weights_all[gt_mask]
+    num_valid_gt = valid_gt_centroids.shape[0]
+
+    pred_centroids = predictions_sample[:, 0:2]
+    pred_weights = predictions_sample[:, 2]
+    num_pred = pred_centroids.shape[0]
+
+    metrics = {}
+    if num_valid_gt == 0:
+        logging.warning("No valid GT clusters in evaluation sample.")
+        metrics = {
+            # Координаты
+            'MAE_Coords': np.nan,
+            'Silhouette': np.nan,
+            'NMI': np.nan,
+            'ARI': np.nan,
+            'Davies_Bouldin': np.nan,
+            'Calinski_Harabasz': np.nan,
+
+            # Веса
+            'MAE_Weights': np.nan,
+            'MSE_Weights': np.nan,
+            'Weighted_Accuracy': np.nan,
+            'Weight_Proportion_Error': np.nan,
+            'Weight_Distribution_Similarity': np.nan,
+
+            # Количественные
+            'Num_Predicted': num_pred,
+            'Num_GT': 0,
+            'Num_Matched': 0
+        }
+        fig, ax = plt.subplots(figsize=(8, 8))
+        if num_pred > 0:
+            ax.scatter(pred_centroids[:, 0], pred_centroids[:, 1], s=100, c='blue', marker='P', label='Predicted',
+                       alpha=0.7)
+        ax.set_title("Evaluation: No Ground Truth Clusters")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.legend()
+        ax.grid(True)
+        return metrics, fig
+
+    # --- 3. Match Predictions to Ground Truth ---
+    pred_coords_exp = np.expand_dims(pred_centroids, 1)
+    valid_gt_coords_exp = np.expand_dims(valid_gt_centroids, 0)
+    pred_weights_exp = np.expand_dims(pred_weights, 1)
+    valid_gt_weights_exp = np.expand_dims(valid_gt_weights, 0)
+    coord_dist_sq = np.sum((pred_coords_exp - valid_gt_coords_exp) ** 2, axis=-1)
+    weight_dist = np.abs(pred_weights_exp - valid_gt_weights_exp)
+    cost_matrix = (coord_weight * np.sqrt(coord_dist_sq)) + (weight_weight * weight_dist)
+
+    try:
+        pred_indices, gt_indices = scipy.optimize.linear_sum_assignment(cost_matrix)
+    except ValueError as e:
+        logging.error(f"Hungarian assignment error: {e}. Skipping matching.")
+        pred_indices, gt_indices = np.array([]), np.array([])
+
+    num_matched = len(pred_indices)
+    metrics['Num_Matched'] = num_matched
+    metrics['Num_Predicted'] = num_pred
+    metrics['Num_GT'] = num_valid_gt
+
+    matched_pred_centroids = pred_centroids[pred_indices]
+    matched_pred_weights = pred_weights[pred_indices]
+    matched_gt_centroids = valid_gt_centroids[gt_indices]
+    matched_gt_weights = valid_gt_weights[gt_indices]
+
+    # --- 4. Calculate Regression Metrics ---
+    if num_matched > 0:
+        # Метрики для координат
+        metrics['MAE_Coords'] = mean_absolute_error(matched_gt_centroids, matched_pred_centroids)
+
+        # Метрики для весов
+        metrics['MAE_Weights'] = mean_absolute_error(matched_gt_weights, matched_pred_weights)
+        metrics['MSE_Weights'] = ((matched_gt_weights - matched_pred_weights) ** 2).mean()
+
+        # Weighted Accuracy (в пределах 10% от истинного значения)
+        rel_error = np.abs(matched_gt_weights - matched_pred_weights) / (matched_gt_weights + 1e-8)
+        metrics['Weighted_Accuracy'] = np.mean(rel_error < 0.1) * 100  # в процентах
+
+        # Weight Proportion Error
+        gt_proportions = matched_gt_weights / matched_gt_weights.sum()
+        pred_proportions = matched_pred_weights / matched_pred_weights.sum()
+        metrics['Weight_Proportion_Error'] = np.abs(gt_proportions - pred_proportions).mean()
+
+        # Weight Distribution Similarity (KL divergence)
+        metrics['Weight_Distribution_Similarity'] = entropy(gt_proportions + 1e-8, pred_proportions + 1e-8)
+    else:
+        metrics['MAE_Coords'] = np.nan
+        metrics['MAE_Weights'] = np.nan
+        metrics['MSE_Weights'] = np.nan
+        metrics['Weighted_Accuracy'] = np.nan
+        metrics['Weight_Proportion_Error'] = np.nan
+        metrics['Weight_Distribution_Similarity'] = np.nan
+
+    # --- 5. Calculate Clustering Metrics ---
+    silhouette, nmi, ari, db, ch = np.nan, np.nan, np.nan, np.nan, np.nan
+    unique_pred_centroids, unique_indices = np.unique(pred_centroids, axis=0, return_index=True)
+
+    if agents_coords.shape[0] > 1 and unique_pred_centroids.shape[0] >= 2:
+        nn = NearestNeighbors(n_neighbors=1).fit(unique_pred_centroids)
+        _, agent_to_pred_centroid_idx = nn.kneighbors(agents_coords)
+        pred_agent_cluster_ids = unique_indices[agent_to_pred_centroid_idx.flatten()]
+
+        if true_agent_cluster_ids is not None and len(true_agent_cluster_ids) == agents_coords.shape[0]:
+            try:
+                silhouette = silhouette_score(agents_coords, pred_agent_cluster_ids)
+                nmi = normalized_mutual_info_score(true_agent_cluster_ids, pred_agent_cluster_ids)
+                ari = adjusted_rand_score(true_agent_cluster_ids, pred_agent_cluster_ids)
+                db = davies_bouldin_score(agents_coords, pred_agent_cluster_ids)
+                ch = calinski_harabasz_score(agents_coords, pred_agent_cluster_ids)
+            except ValueError as e:
+                logging.warning(f"Could not calculate sklearn clustering metrics: {e}")
+
+    metrics['Silhouette'] = silhouette
+    metrics['NMI'] = nmi
+    metrics['ARI'] = ari
+    metrics['Davies_Bouldin'] = db
+    metrics['Calinski_Harabasz'] = ch
+    # --- 6. Visualization ---
+    fig, ax = plt.subplots(figsize=(9, 8))
+    if plot_agents and agents_coords.shape[0] > 0:
+        ax.scatter(agents_coords[:, 0], agents_coords[:, 1], s=5, alpha=0.3, label='Agents', c='gray', zorder=1)
+    if num_valid_gt > 0:
+        ax.scatter(valid_gt_centroids[:, 0], valid_gt_centroids[:, 1], s=150, c='red', marker='X', label='Ground Truth',
+                   zorder=3)
+        for i in range(num_valid_gt):
+            ax.text(valid_gt_centroids[i, 0] + 0.01, valid_gt_centroids[i, 1] + 0.01, f" W:{valid_gt_weights[i]:.0f}",
+                    fontsize=8, color='red', zorder=4)
+    if num_pred > 0:
+        ax.scatter(pred_centroids[:, 0], pred_centroids[:, 1], s=150, facecolors='none', edgecolors='blue', marker='o',
+                   label='Predicted', zorder=2, linewidth=1.5)
+        for i in range(num_pred):
+            ax.text(pred_centroids[i, 0] + 0.01, pred_centroids[i, 1] - 0.02, f" w:{pred_weights[i]:.1f}", fontsize=8,
+                    color='blue', zorder=4)
+    if num_matched > 0:
+        for i in range(num_matched):
+            ax.plot([matched_pred_centroids[i, 0], matched_gt_centroids[i, 0]],
+                    [matched_pred_centroids[i, 1], matched_gt_centroids[i, 1]],
+                    linestyle='--', color='green', linewidth=0.8, zorder=1)
+
+    ax.set_xlabel("X-coordinate");
+    ax.set_ylabel("Y-coordinate")
+    ax.set_title(f"Evaluation: Matched={num_matched}/{num_valid_gt} GT, MAE Coords={metrics['MAE_Coords']:.4f}")
+    ax.set_xlim(0, 1);
+    ax.set_ylim(0, 1);
+    ax.legend(loc='upper right', fontsize='small')
+    ax.grid(True, linestyle='--', alpha=0.6);
+    ax.set_aspect('equal', adjustable='box')
+
+    metrics_text = "Metrics:\n" + "\n".join(
+        [f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}" for k, v in metrics.items()])
+    fig.text(0.01, 0.01, metrics_text, fontsize=8, verticalalignment='bottom', wrap=True)
+    fig.tight_layout(rect=[0.1, 0.05, 1, 0.95])  # Adjust layout
+
+    return metrics, fig
+
+    # --- Dataset and DataLoader (Training) ---
+    if not args.skip_training:
+        print("Initializing training dataset...")
+        train_dataset = CompressedSensingGridDataset(
+            agents_num=args.agents_num, grid_size=args.grid_size, m=args.m_measurements,
+            max_clusters=args.max_clusters, min_clusters=args.min_clusters,
+            ds_size=args.ds_size, device=DEVICE  # Phi matrix on training device is fine
+        )
+        print(f"Training dataset size: {len(train_dataset)}")
+        if len(train_dataset) == 0: raise ValueError("Training dataset is empty.")
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=min(4, os.cpu_count()),  # Adjust workers
+            pin_memory=True if DEVICE.type == 'cuda' else False,
+            persistent_workers=True if min(4, os.cpu_count()) > 0 else False  # Can speed up loading
+        )
+
+        # --- Scheduler ---
+        total_steps = len(train_loader) * args.epochs
+        scheduler = get_scheduler(optimizer, warmup_steps=args.warmup_steps, total_steps=total_steps)
+        print(f"Scheduler: Warmup={args.warmup_steps}, Total Steps={total_steps}")
+
+        # --- Training Loop ---
+        print("Starting training...")
+        for epoch in range(args.epochs):
+            model.train()
+            total_epoch_loss = 0.0
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+
+            for batch_idx, (y_tilde, targets, masks, _, _) in enumerate(progress_bar):  # Ignore coords/IDs for training
+                y_tilde, targets, masks = y_tilde.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
+                optimizer.zero_grad()
+                predictions = model(y_tilde)
+                loss = masked_hungarian_loss(
+                    predictions, targets, masks,
+                    coord_weight=args.coord_weight, weight_weight=args.weight_weight
+                )
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                total_epoch_loss += loss.item()
+                progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
+
+            avg_epoch_loss = total_epoch_loss / len(train_loader)
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Epoch {epoch + 1}/{args.epochs} Completed: Avg Loss: {avg_epoch_loss:.4f}, LR: {current_lr:.6f}")
+
+            # Save Checkpoint
+            checkpoint_path = os.path.join(args.checkpoint_dir, f"model_epoch_{epoch + 1}.pt")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': avg_epoch_loss,
+                'args': vars(args)
+            }, checkpoint_path)
+            print(f"Checkpoint saved to {checkpoint_path}")
+
+            last_chkpt_path = os.path.join(args.checkpoint_dir, "last_model.pt")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'args': vars(args)
+            }, last_chkpt_path)
+
+            print("\nTraining complete.")
+    else:
+        print("Skipping training as requested.")
