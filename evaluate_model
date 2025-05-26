@@ -1,0 +1,498 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import logging
+import matplotlib.pyplot as plt
+import scipy.optimize  # For Hungarian algorithm
+import argparse
+from tqdm import tqdm
+import os
+from sklearn.metrics import silhouette_score, normalized_mutual_info_score, adjusted_rand_score, mean_absolute_error
+from sklearn.neighbors import NearestNeighbors  # To assign agents to predicted clusters
+import pandas as pd  # For displaying metrics nicely
+import multiprocessing as mp
+
+from dataset_generation import ClusterPredictionModel, CompressedSensingGridDataset, 
+from model_defination import get_scheduler, masked_hungarian_loss, \
+    evaluate_sample
+import json
+
+def print_weight_metrics_report(results_list, save_dir):
+    """Создает отдельный отчет по метрикам весов центроидов"""
+    if not results_list:
+        print("No weight metrics available for reporting")
+        return
+
+    weight_metrics = [
+        'MAE_Weights',
+        'MSE_Weights',
+        'Weighted_Accuracy',
+        'Weight_Proportion_Error',
+        'Weight_Distribution_Similarity'
+    ]
+
+    df = pd.DataFrame(results_list)
+
+    existing_metrics = [m for m in weight_metrics if m in df.columns]
+    if not existing_metrics:
+        print("No weight metrics found in the results")
+        return
+
+    weight_df = df[existing_metrics]
+
+    stats_df = pd.DataFrame({
+        'Mean': weight_df.mean(),
+        'Std': weight_df.std(),
+        'Min': weight_df.min(),
+        'Median': weight_df.median(),
+        'Max': weight_df.max()
+    })
+
+    print("\n=== WEIGHT METRICS REPORT ===")
+    print(stats_df.to_string(float_format="%.4f"))
+
+    report_path = os.path.join(save_dir, 'weight_metrics_report.csv')
+    stats_df.to_csv(report_path)
+    print(f"\nWeight metrics report saved to {report_path}")
+
+    plt.figure(figsize=(12, 6))
+    weight_df.plot.box(vert=False)
+    plt.title('Distribution of Weight Metrics')
+    plt.tight_layout()
+    plot_path = os.path.join(save_dir, 'weight_metrics_distribution.png')
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"Weight metrics distribution plot saved to {plot_path}")
+
+
+def evaluate_agent_counts(model, device, args):
+    agent_counts = [10, 20, 30, 50, 100, 150]
+    results = {}
+
+    for count in agent_counts:
+        print(f"\nEvaluating for {count} agents...")
+        temp_dataset = CompressedSensingGridDataset(
+            agents_num=count,
+            grid_size=args.grid_size,
+            m=args.m_measurements,
+            max_clusters=args.max_clusters,
+            min_clusters=args.min_clusters,
+            ds_size=15,
+            device=device
+        )
+
+        temp_loader = DataLoader(temp_dataset, batch_size=1, shuffle=False)
+        count_metrics = []
+
+        for y_tilde, targets, masks, agents_coords, true_ids in temp_loader:
+            metrics, _ = evaluate_sample(
+                model,
+                y_tilde.squeeze(0),
+                targets.squeeze(0),
+                masks.squeeze(0),
+                agents_coords.squeeze(0).numpy(),
+                true_ids.squeeze(0).numpy(),
+                device,
+                plot_agents=False
+            )
+            count_metrics.append(metrics)
+
+        results[count] = {
+            metric: np.nanmean([m.get(metric, np.nan) for m in count_metrics])
+            for metric in count_metrics[0].keys()
+            if isinstance(count_metrics[0].get(metric, None), (int, float, np.float64))
+        }
+
+    return results
+
+
+def plot_sensitivity_results(results, save_dir):
+    available_metrics = []
+    for count in results:
+        available_metrics.extend(results[count].keys())
+    available_metrics = list(set(available_metrics))  # Уникальные метрики
+
+    # Выбираем только основные метрики, которые есть в данных
+    possible_metrics = ['MAE_Coords', 'MAE_Weights', 'Silhouette', 'NMI']
+    metrics_to_plot = [m for m in possible_metrics if m in available_metrics]
+
+    if not metrics_to_plot:
+        print("No metrics available for plotting")
+        return
+
+    agent_counts = sorted(results.keys())
+
+    n_plots = len(metrics_to_plot)
+    n_cols = 2
+    n_rows = (n_plots + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 5 * n_rows))
+
+    if n_plots == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+
+    for i, metric in enumerate(metrics_to_plot):
+        ax = axes[i]
+        values = []
+
+        for count in agent_counts:
+            val = results[count].get(metric, np.nan)
+            values.append(val)
+
+        valid_counts = [c for c, v in zip(agent_counts, values) if not np.isnan(v)]
+        valid_values = [v for v in values if not np.isnan(v)]
+
+        if valid_values:
+            ax.plot(valid_counts, valid_values, 'o-', markersize=8)
+            ax.set_title(metric)
+            ax.set_xlabel('Number of Agents')
+            ax.grid(True)
+
+            for x, y in zip(valid_counts, valid_values):
+                ax.annotate(f'{y:.3f}', (x, y), textcoords="offset points",
+                            xytext=(0, 10), ha='center')
+        else:
+            ax.text(0.5, 0.5, f'No {metric} data', ha='center', va='center')
+            ax.set_title(metric)
+
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    plot_path = os.path.join(save_dir, 'agent_count_sensitivity.png')
+    fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Sensitivity plot saved to {plot_path}")
+
+
+# Configure logging
+
+logging.basicConfig(filename='example.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+if __name__ == "__main__":
+    # --- SET MULTIPROCESSING START METHOD FOR CUDA ---
+    # This MUST be done before any CUDA initialization or DataLoader with workers > 0
+    try:
+        # Check if start method is already set (important in some environments like Jupyter)
+        current_start_method = mp.get_start_method(allow_none=True)
+        if current_start_method != 'spawn':
+            mp.set_start_method('spawn', force=True)
+            print(f"Set multiprocessing start method to 'spawn'. Previous: {current_start_method}")
+        elif current_start_method is None:  # Not set yet
+            mp.set_start_method('spawn', force=True)
+            print("Set multiprocessing start method to 'spawn'.")
+        # If already 'spawn', no need to set again
+    except RuntimeError as e:
+        # Might happen if context has already been initialized implicitly
+        print(f"Warning: Could not set multiprocessing start method to 'spawn': {e}")
+        print("CUDA operations in DataLoader workers might fail if num_workers > 0.")
+    # ------------------------------------------------
+
+    parser = argparse.ArgumentParser(description='Train and Evaluate Cluster Prediction Model.')
+    parser.add_argument('--agents_num', type=int, default=100, help='Number of agents')
+    parser.add_argument('--grid_size', type=int, default=64, help='Grid size for dataset generation')
+    parser.add_argument('--m_measurements', type=int, default=3072, help='Number of compressed measurements (m)')
+    parser.add_argument('--max_clusters', type=int, default=3, help='Maximum number of clusters')
+    parser.add_argument('--min_clusters', type=int, default=3, help='Minimum number of clusters')
+    parser.add_argument('--ds_size', type=int, default=2000,
+                        help='Dataset size for training')  # Reduced for faster demo
+    parser.add_argument('--eval_ds_size', type=int, default=100, help='Dataset size for evaluation')  # Small eval set
+    # Model Args
+    parser.add_argument('--hidden_dims', type=int, nargs='+', default=[1024, 1024, 512], help='Hidden layer dimensions')
+    # Training Args
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=30, help='Number of epochs')  # Reduced for faster demo
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--coord_weight', type=float, default=1.0, help='Weight for coordinate loss in Hungarian cost')
+    parser.add_argument('--weight_weight', type=float, default=0.1,
+                        help='Weight for cluster size loss in Hungarian cost')
+    parser.add_argument('--warmup_steps', type=int, default=500, help='Warmup steps for scheduler')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints_cs_full_2',
+                        help='Directory to save checkpoints')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
+                        help='Device (cuda or cpu)')
+    parser.add_argument('--skip_training', default=True, action='store_true',
+                        help='Skip training and only run evaluation')
+    parser.add_argument('--checkpoint_load', type=str, default='last_model2.pt',
+                        help='Checkpoint filename to load for eval (e.g., last_model.pt or model_epoch_5.pt)')
+    parser.add_argument('--num_plots', type=int, default=15,
+                        help='Number of evaluation samples to plot')  # Default to 15
+
+    args, unknown = parser.parse_known_args()
+
+    print("--- Configuration ---")
+    for key, value in vars(args).items(): print(f"{key}: {value}")
+    print("----------------------")
+
+    DEVICE = torch.device(args.device)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    # --- Model ---
+    print("Initializing model...")
+    model = ClusterPredictionModel(
+        measurement_dim=args.m_measurements,
+        max_clusters=args.max_clusters,
+        hidden_dims=args.hidden_dims
+    ).to(DEVICE)
+    print(f"Model initialized on {DEVICE}.")
+
+    # --- Optimizer ---
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+
+    if not args.skip_training:
+        print("Initializing training dataset...")
+        # Ensure dataset uses the correct device for Phi matrix if relevant during training
+        train_dataset = CompressedSensingGridDataset(
+            agents_num=args.agents_num, grid_size=args.grid_size, m=args.m_measurements,
+            max_clusters=args.max_clusters, min_clusters=args.min_clusters,
+            ds_size=args.ds_size, device=DEVICE  # Phi matrix generation on training device
+        )
+        print(f"Training dataset size: {len(train_dataset)}")
+        if len(train_dataset) == 0: raise ValueError("Training dataset is empty.")
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=min(4, os.cpu_count()),  # Adjust workers
+            pin_memory=True if DEVICE.type == 'cuda' else False,
+            persistent_workers=True if min(4, os.cpu_count()) > 0 else False  # Can speed up loading
+        )
+
+        # --- Scheduler ---
+        total_steps = len(train_loader) * args.epochs
+        scheduler = get_scheduler(optimizer, warmup_steps=args.warmup_steps, total_steps=total_steps)
+        print(f"Scheduler: Warmup={args.warmup_steps}, Total Steps={total_steps}")
+
+        # --- Training Loop ---
+        print("Starting training...")
+        # ... (Training loop code as before) ...
+        for epoch in range(args.epochs):
+            model.train()
+            total_epoch_loss = 0.0
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+
+            for batch_idx, batch_data in enumerate(progress_bar):
+                # Ensure batch_data has the expected 5 elements
+                if len(batch_data) != 5:
+                    logging.error(
+                        f"Unexpected data format from DataLoader. Expected 5 items, got {len(batch_data)}. Check dataset __getitem__.")
+                    continue  # Skip batch if format is wrong
+
+                y_tilde, targets, masks, _, _ = batch_data  # Ignore coords/IDs for training loss
+
+                y_tilde, targets, masks = y_tilde.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
+                optimizer.zero_grad()
+                # ADDED
+                norm_factor = 1.0 / np.sqrt(args.agents_num)
+                predictions = model(y_tilde * norm_factor)
+                loss = masked_hungarian_loss(
+                    predictions, targets, masks,
+                    coord_weight=args.coord_weight, weight_weight=args.weight_weight
+                )
+
+                # Check for NaN loss
+                if torch.isnan(loss):
+                    logging.warning(
+                        f"NaN loss detected at Epoch {epoch + 1}, Batch {batch_idx}. Skipping backward pass for this batch.")
+                    continue  # Skip optimizer step if loss is NaN
+
+                loss.backward()
+                # Optional: Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                total_epoch_loss += loss.item()
+                progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
+
+            avg_epoch_loss = total_epoch_loss / max(1, len(train_loader))  # Avoid division by zero
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Epoch {epoch + 1}/{args.epochs} Completed: Avg Loss: {avg_epoch_loss:.4f}, LR: {current_lr:.6f}")
+
+            checkpoint_path = os.path.join(args.checkpoint_dir, f"model_epoch_{epoch + 1}.pt")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': avg_epoch_loss,
+                'args': vars(args)  # <--- CHANGE: Save args as a dictionary
+            }, checkpoint_path)
+            print(f"Checkpoint saved to {checkpoint_path}")
+
+            # Optional: Save last checkpoint separately
+            last_chkpt_path = os.path.join(args.checkpoint_dir, "last_model.pt")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'args': vars(args)  # <--- CHANGE: Save args as a dictionary
+            }, last_chkpt_path)
+
+        print("\nTraining complete.")
+    else:
+        print("Skipping training as requested.")
+
+    # --- Evaluation ---
+    print("\n--- Starting Evaluation ---")
+    CHECKPOINT_TO_LOAD = os.path.join(args.checkpoint_dir, args.checkpoint_load)
+
+    # Inside the Evaluation section:
+
+    if os.path.exists(CHECKPOINT_TO_LOAD):
+        print(f"Loading model checkpoint from: {CHECKPOINT_TO_LOAD}")
+        # Load with weights_only=True (default in PyTorch 2.6+)
+        # Dictionaries saved in the checkpoint are safe and will load.
+        checkpoint = torch.load(CHECKPOINT_TO_LOAD, map_location=DEVICE)
+
+        # --- CHANGE: Expect 'args' to be a dictionary ---
+        saved_args_dict = checkpoint.get('args', None)
+
+        # Check if we got a dictionary
+        if saved_args_dict and isinstance(saved_args_dict, dict):
+            # Convert dict back to Namespace for consistent access later
+            saved_args = argparse.Namespace(**saved_args_dict)
+            print("Recreating model architecture from saved args (loaded as dict).")
+            try:
+                # Recreate model using attributes from the reconstructed Namespace
+                model = ClusterPredictionModel(
+                    measurement_dim=saved_args.m_measurements,
+                    max_clusters=saved_args.max_clusters,
+                    hidden_dims=saved_args.hidden_dims
+                ).to(DEVICE)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("Model weights loaded successfully.")
+            except AttributeError as e:
+                print(f"Error recreating model from saved args dict: {e}. Check args consistency.")
+                # Fallback logic... (as before)
+                model = ClusterPredictionModel(  # Fallback to current args
+                    measurement_dim=args.m_measurements,
+                    max_clusters=args.max_clusters,
+                    hidden_dims=args.hidden_dims
+                ).to(DEVICE)
+                try:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    print("Loaded weights into model defined by current args (potential mismatch).")
+                except Exception as load_err:
+                    print(f"Failed to load state dict into current model: {load_err}")
+                    exit()
+            except Exception as e:  # Catch other potential errors
+                print(f"Unexpected error loading model state_dict: {e}")
+                exit()
+        else:
+            print(
+                "Warning: Could not find 'args' dict in checkpoint or format invalid. Loading weights into model defined by current script args.")
+            try:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("Model weights loaded successfully (assuming current script args match).")
+            except Exception as e:
+                print(f"Error loading state dict: {e}. Architecture mismatch likely.")
+                exit()
+    else:
+        print(f"ERROR: Checkpoint '{CHECKPOINT_TO_LOAD}' not found. Cannot evaluate.")
+        exit()
+
+    # --- Evaluation Dataset ---
+    print("Initializing evaluation dataset...")
+    eval_dataset = CompressedSensingGridDataset(
+        agents_num=args.agents_num, grid_size=args.grid_size, m=args.m_measurements,
+        max_clusters=args.max_clusters, min_clusters=args.min_clusters,
+        ds_size=args.eval_ds_size, device=DEVICE  # Phi matrix generation device for eval
+    )
+    # Use shuffle=True to get varied samples if desired, or False for consistent samples (0, 1, 2...)
+    eval_loader = DataLoader(eval_dataset, batch_size=1, shuffle=True)
+
+    if len(eval_loader) == 0:
+        print("Evaluation dataloader is empty.")
+        exit()
+
+    print(f"Evaluating samples and generating up to {args.num_plots} plots...")
+    plots_saved = 0
+    all_metrics = []  # Collect metrics for all evaluated samples
+
+    # Use tqdm for progress tracking during evaluation
+    eval_progress_bar = tqdm(eval_loader, desc="Evaluating Samples",
+                             total=min(len(eval_loader), args.eval_ds_size))  # Use total for accurate bar
+
+    for i, batch_data in enumerate(eval_progress_bar):
+        # Stop if we have saved enough plots
+        # Check this condition *after* processing the sample to ensure metrics are collected
+        # Or check *before* processing if you strictly want only num_plots evaluations
+        # Let's evaluate all, but only save num_plots figures
+
+        if len(batch_data) != 5:
+            logging.error(f"Unexpected data format from Eval DataLoader. Expected 5 items, got {len(batch_data)}.")
+            continue
+
+        y_tilde_eval, targets_eval, mask_eval, agents_coords_eval, true_ids_eval = batch_data
+
+        # Squeeze batch dim and convert types
+        y_tilde_eval = y_tilde_eval.squeeze(0)
+        targets_eval = targets_eval.squeeze(0)
+        mask_eval = mask_eval.squeeze(0)
+        agents_coords_eval = agents_coords_eval.squeeze(0).numpy() if torch.is_tensor(
+            agents_coords_eval) else agents_coords_eval.squeeze(0)
+        true_ids_eval = true_ids_eval.squeeze(0).numpy() if torch.is_tensor(true_ids_eval) else true_ids_eval.squeeze(0)
+
+        # Generate plot and metrics for this sample
+        # Pass the original dataset index 'i' IF shuffle=False, otherwise just a counter
+        current_sample_identifier = i  # Use loop counter as identifier
+
+        metrics_dict, eval_figure = evaluate_sample(
+            model=model, y_tilde_sample=y_tilde_eval, targets_sample=targets_eval, mask_sample=mask_eval,
+            agents_coords=agents_coords_eval, true_agent_cluster_ids=true_ids_eval,
+            device=DEVICE, coord_weight=args.coord_weight, weight_weight=args.weight_weight,
+            sample_index=current_sample_identifier  # Pass identifier for title
+        )
+        all_metrics.append(metrics_dict)
+
+        # Save the plot only if we haven't reached the limit
+        if plots_saved < args.num_plots:
+            plot_filename = os.path.join(args.checkpoint_dir, f"evaluation_plot_sample_{current_sample_identifier}.png")
+            try:
+                eval_figure.savefig(plot_filename, dpi=150)
+                # print(f"Evaluation plot saved to {plot_filename}") # Reduce console noise
+                plots_saved += 1
+            except Exception as e:
+                print(f"Error saving plot {plot_filename}: {e}")
+
+        plt.close(eval_figure)  # IMPORTANT: Close the figure to free memory
+
+        # Update progress bar description with latest average MAE (optional)
+        # This requires calculating running average, more complex. Sticking to default tqdm is fine.
+
+        # --- Aggregate and Print Metrics for ALL evaluated samples ---
+        if all_metrics:
+            metrics_df = pd.DataFrame(all_metrics)
+
+            # Создаем красивый отчет
+            report_data = []
+            for metric in metrics_df.columns:
+                if metrics_df[metric].dtype in [np.float64, np.int64]:
+                    mean_val = metrics_df[metric].mean()
+                    std_val = metrics_df[metric].std()
+                    report_data.append({
+                        'Metric': metric,
+                        'Mean ± Std': f"{mean_val:.4f} ± {std_val:.4f}",
+                        'Min': f"{metrics_df[metric].min():.4f}",
+                        'Max': f"{metrics_df[metric].max():.4f}"
+                    })
+
+            report_df = pd.DataFrame(report_data)
+            print("\n--- Comprehensive Evaluation Report ---")
+            print(report_df.to_string(index=False))
+            print("-------------------------------------")
+            report_df.to_csv(os.path.join(args.checkpoint_dir, "evaluation_report.csv"), index=False)
+
+            key_metrics = ['MAE_Coords', 'MAE_Weights', 'MSE_Weights', 'Silhouette',
+                           'NMI', 'ARI', 'Davies_Bouldin', 'Calinski_Harabasz']
+            key_report = report_df[report_df['Metric'].isin(key_metrics)]
+
+            print("\n--- Key Metrics Summary ---")
+            print(key_report.to_string(index=False))
+            print("--------------------------")
+            print_weight_metrics_report(all_metrics, args.checkpoint_dir)
+
+            key_report.to_csv(os.path.join(args.checkpoint_dir, "key_metrics_report.csv"), index=False)
+
+    print("Evaluation Finished.")
