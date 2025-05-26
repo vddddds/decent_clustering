@@ -1,0 +1,157 @@
+import numpy as np
+import torch
+import asyncio
+import matplotlib.pyplot as plt
+import nest_asyncio
+
+def generate_random_adj_matrix(n, p_edge=0.5):
+    """
+    Generates a random adjacency matrix for an undirected graph with probabilistic connections.
+
+    Parameters:
+    - n: Number of nodes in the graph (size of the matrix).
+    - p_edge: Probability of creating an edge between two nodes (between 0 and 1).
+
+    Returns:
+    - adj_matrix: A numpy array representing the adjacency matrix of the graph.
+    """
+
+    # Create an empty adjacency matrix (all zeros)
+    adj_matrix = np.zeros((n, n), dtype=int)
+
+    # Loop through pairs of nodes (i, j)
+    for i in range(n):
+        for j in range(i + 1, n):  # Only loop over the upper triangle of the matrix, since it's undirected
+            if np.random.rand() < p_edge:
+                # If random number is less than p_edge, create a connection (1)
+                adj_matrix[i, j] = 1
+                adj_matrix[j, i] = 1  # Since the graph is undirected
+
+    return adj_matrix
+
+def solve_alpha_k(H_one, gamma, nu, mu, h):
+  """
+  Решает уравнение alpha_k^2 - H1(1-alpha_k)Yk + H1*alpha_k(nu-mu) - 0.001 = 0
+  относительно alpha_k, используя векторные операции numpy.
+
+  Args:
+    H1: Численное значение H1.
+    Yk: Массив значений Yk.
+    nu: Численное значение nu.
+    mu: Численное значение mu.
+
+  Returns:
+    Массив решений alpha_k для каждого значения Yk.
+  """
+  L = 0.505
+  H_one = h - h**2*L/2
+  a = np.ones_like(gamma)  # Коэффициент при alpha_k^2
+  b = 2*(H_one * gamma - H_one * (nu - mu) ) # Коэффициент при alpha_k
+  c = 2*(-H_one * gamma) - 0.0001 # Свободный член (учитываем -0.001)
+
+  discriminant = b**2 - 4 * a * c
+
+  discriminant = np.where(discriminant < 0, 0, discriminant)
+
+  alpha_k1 = (-b + np.sqrt(discriminant)) / (2 * a)
+  alpha_k2 = (-b - np.sqrt(discriminant)) / (2 * a)
+
+  return alpha_k1, alpha_k2
+
+adj_matrix = generate_random_adj_matrix(150, p_edge=0.2)
+#(np.random.rand(num_agents, num_agents) < 0.2).astype(int)
+np.fill_diagonal(adj_matrix, 0)
+adj_matrix = torch.tensor(adj_matrix)
+print(adj_matrix)
+
+ 
+
+nest_asyncio.apply()
+
+async def accelerated_for_agent(i, local_measurements, adj_matrix, alpha=0.003, n_lvp=10, h=0.002,
+                                 gamma=0.007, mu=0.9, nu=0.8, lam=0, H_one=0.00199899):
+
+    global message_count_global
+    global memory_used_global
+
+    if isinstance(local_measurements, np.ndarray):
+        local_measurements = torch.tensor(local_measurements)
+    elif not isinstance(local_measurements, torch.Tensor):
+        raise ValueError("local_measurements must be a numpy array or torch tensor")
+
+    initial_states = local_measurements[i, :, :]
+    v_est = torch.clone(initial_states).detach()
+    y_hat = torch.clone(initial_states).detach()
+    measurements_over_time = [initial_states.clone()]
+
+    memory_used_global += (
+        initial_states.element_size() * initial_states.nelement() * 3  # v_est, y_hat, initial_states
+    )
+
+    for k in range(n_lvp):
+        v_est_new = torch.clone(v_est).detach()
+        y_hat_new = torch.clone(y_hat).detach()
+
+        y_hat_neighbors = []
+        for j in range(local_measurements.shape[0]):
+            if i != j and adj_matrix[i, j] == 1:
+                y_hat_neighbors.append(local_measurements[j, :, :])
+                message_count_global += 1  # Одно сообщение от j к i
+
+        if y_hat_neighbors:
+            y_hat_neighbors = torch.stack(y_hat_neighbors)
+        else:
+            y_hat_neighbors = torch.zeros_like(local_measurements[i, :, :])
+
+        memory_used_global += y_hat_neighbors.element_size() * y_hat_neighbors.nelement()
+
+        alpha_k_left, alpha_k_right = solve_alpha_k(H_one, gamma, nu, mu, h)
+        alpha_k = (
+            alpha_k_left if 0 < alpha_k_left < 1 and alpha_k_left > alpha else
+            alpha_k_right if 0 < alpha_k_right < 1 and alpha_k_right > alpha else
+            0.01
+        )
+
+        gamma_new = (1 - alpha_k) * gamma + alpha_k * (mu - nu)
+        s = 1 / (gamma + alpha_k * (mu - nu)) * (alpha_k * gamma * v_est_new + gamma_new * y_hat_new)
+        gamma = gamma_new
+        gradient_k = torch.sum(s - y_hat_neighbors, dim=0)
+        y_hat_new = s - h * gradient_k
+        v_est_new = 1 / gamma * ((1 - alpha_k) * gamma * v_est_new + alpha_k * (mu - nu) * s - alpha_k * gradient_k)
+        v_est = torch.clone(v_est_new).detach()
+        measurements_over_time.append(y_hat_new.clone())
+
+    final_measurement = measurements_over_time[-1].unsqueeze(0)
+    return final_measurement
+
+    # Function to call the accelerated_for_agent asynchronously for all agents
+async def run_for_all_agents(local_measurements, adj_matrix, n_agents=100):
+    # Create a list to hold the tasks for each agent
+    tasks = []
+    for i in range(n_agents):
+        tasks.append(accelerated_for_agent(i, local_measurements, adj_matrix))
+
+    # Wait for all tasks to finish and collect the results
+    results = await asyncio.gather(*tasks)
+
+    # Convert the list of results to a tensor (n_agents, 1, 8, 8)
+    return torch.cat(results, dim=0)
+
+# Function to run the code, compatible with already running event loops
+async def run():
+    # Define example local measurements and adjacency matrix
+    n_agents = 150
+    local_measurements = global_measurements[0]  # 100 agents with 16x16 measurements
+     # Random adjacency matrix (0 or 1)
+    # Run the algorithm for all agents
+    result = await run_for_all_agents(local_measurements, adj_matrix, n_agents)
+    return result
+
+# Example usage
+if __name__ == "__main__":
+    # Run the async function in Colab
+    result = await run()
+    print('result', result)
+    print(f"Total messages exchanged: {message_count_global}")
+    print(f"Total memory used (bytes): {memory_used_global}")
+    print(f"Memory used (MB): {memory_used_global / (1024 ** 2):.2f}")
