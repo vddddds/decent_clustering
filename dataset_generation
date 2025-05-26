@@ -1,0 +1,291 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import logging
+import matplotlib.pyplot as plt
+import scipy.optimize  # For Hungarian algorithm
+import argparse
+from tqdm import tqdm
+import os
+from sklearn.metrics import silhouette_score, normalized_mutual_info_score, adjusted_rand_score, mean_absolute_error, \
+    davies_bouldin_score, calinski_harabasz_score
+from sklearn.neighbors import NearestNeighbors  # To assign agents to predicted clusters
+import pandas as pd  # For displaying metrics nicely
+import multiprocessing as mp
+from sklearn.metrics import davies_bouldin_score, calinski_harabasz_score
+from scipy.stats import entropy
+import pandas as pd
+import numpy as np
+
+
+class BaseAgentsDataset(Dataset):
+    """
+    Base class to generate agent positions grouped into clusters in a 2D continuous space.
+    Also returns the true cluster ID for each agent.
+    """
+
+    def __init__(
+            self,
+            agents_num: int,
+            dim: int = 2,
+            min_clusters: int = 1,
+            max_clusters: int = 5,
+            min_distance: float = 0.15,
+            bounds: tuple = ((0.0, 0.0), (1.0, 1.0)),
+            cluster_std_dev_range: tuple = (0.01, 0.05),
+            ds_size: int = 100000,
+    ) -> None:
+        super().__init__()
+        if dim != 2:
+            raise ValueError("Currently only supports dim=2")
+        if not (0 < min_clusters <= max_clusters):
+            raise ValueError("Cluster counts must satisfy 0 < min_clusters <= max_clusters")
+
+        self.total_agents = agents_num
+        self.dim = dim
+        self.min_clusters = min_clusters
+        self.max_clusters = max_clusters
+        self.min_distance = min_distance
+        self.bounds = np.array(bounds, dtype=np.float32)
+        self.cluster_std_dev_range = cluster_std_dev_range
+        self.ds_size = ds_size
+
+        logging.info(
+            f"Initialized BaseAgentsDataset: N={agents_num}, K=[{min_clusters}-{max_clusters}], size={ds_size}")
+
+    @staticmethod
+    def _generate_clusters(num_clusters, min_distance, bounds):
+        """Generates non-overlapping cluster centroids."""
+        clusters = []
+        attempts = 0
+        max_attempts = num_clusters * 100  # Prevent infinite loops
+
+        while len(clusters) < num_clusters and attempts < max_attempts:
+            centroid = np.random.uniform(
+                low=bounds[0], high=bounds[1], size=bounds.shape[1]  # Assuming bounds shape is (2, dim)
+            ).astype(np.float32)
+
+            if not clusters or \
+                    all(np.linalg.norm(centroid - c) >= min_distance for c in clusters):
+                clusters.append(centroid)
+            attempts += 1
+
+        if len(clusters) < num_clusters:
+            logging.warning(
+                f"Could only generate {len(clusters)} clusters out of {num_clusters} requested due to distance constraints.")
+            num_clusters = len(clusters)  # Adjust actual number if needed
+
+        return np.array(clusters).astype(np.float32), num_clusters
+
+    def __getitem__(self, index):
+        # 1. Generate Cluster Centroids
+        num_clusters_actual = np.random.randint(self.min_clusters, self.max_clusters + 1)
+        cluster_centroids, num_clusters_generated = self._generate_clusters(
+            num_clusters=num_clusters_actual,
+            min_distance=self.min_distance,
+            bounds=self.bounds,
+        )
+
+        if num_clusters_generated == 0:
+            logging.error("Failed to generate any clusters for a sample.")
+            return self._get_dummy_data()
+
+        padded_clusters = np.zeros((self.max_clusters, self.dim), dtype=np.float32)
+        padded_clusters[:num_clusters_generated] = cluster_centroids
+        cluster_mask = np.zeros((self.max_clusters,), dtype=np.float32)
+        cluster_mask[:num_clusters_generated] = 1.0
+
+        # 2. Assign Agents to Clusters (Weights)
+        if num_clusters_generated > 0:
+            pvals = np.ones(num_clusters_generated) / num_clusters_generated
+            agents_per_cluster_actual = np.random.multinomial(
+                self.total_agents, pvals=pvals
+            ).astype(np.int32)
+            # print kappa
+        else:
+            agents_per_cluster_actual = np.array([], dtype=np.int32)
+
+        padded_agents_per_cluster = np.zeros((self.max_clusters,), dtype=np.int32)
+        padded_agents_per_cluster[:num_clusters_generated] = agents_per_cluster_actual
+
+        # 3. Generate Agent Positions and Track True IDs
+        agents_list = []
+        cluster_ids_list = []  # Keep track of which cluster each agent belongs to
+
+        for cluster_idx in range(num_clusters_generated):
+            n_agents_in_cluster = agents_per_cluster_actual[cluster_idx]
+            if n_agents_in_cluster == 0:
+                continue
+
+            mean = cluster_centroids[cluster_idx]
+            std_dev = np.random.uniform(
+                low=self.cluster_std_dev_range[0], high=self.cluster_std_dev_range[1]
+            )
+            cov = np.eye(self.dim) * (std_dev ** 2)
+
+            cluster_agents = np.random.multivariate_normal(
+                mean=mean, cov=cov, size=n_agents_in_cluster
+            ).astype(np.float32)
+
+            np.clip(cluster_agents, self.bounds[0], self.bounds[1], out=cluster_agents)
+            agents_list.append(cluster_agents)
+            # Add the true cluster index (0 to num_clusters_generated-1) for each agent
+            cluster_ids_list.extend([cluster_idx] * n_agents_in_cluster)
+
+        if not agents_list:
+            agents = np.empty((0, self.dim), dtype=np.float32)
+            true_agent_cluster_ids = np.array([], dtype=int)
+        else:
+            agents = np.concatenate(agents_list, axis=0)
+            true_agent_cluster_ids = np.array(cluster_ids_list, dtype=int)
+
+        # Shuffle agents AND their corresponding cluster IDs together
+        if agents.shape[0] > 0:
+            shuffle_indices = np.random.permutation(agents.shape[0])
+            agents = agents[shuffle_indices]
+            true_agent_cluster_ids = true_agent_cluster_ids[shuffle_indices]
+
+        return (
+            agents,  # (n, dim) float32 numpy array
+            padded_clusters,  # (max_k, dim) float32 numpy array
+            cluster_mask,  # (max_k,) float32 numpy array
+            padded_agents_per_cluster,  # (max_k,) int32 numpy array (weights)
+            true_agent_cluster_ids  # (n,) int numpy array (true labels)
+        )
+
+    def _get_dummy_data(self):
+        """Returns placeholder data when generation fails."""
+        agents = np.empty((0, self.dim), dtype=np.float32)
+        padded_clusters = np.zeros((self.max_clusters, self.dim), dtype=np.float32)
+        cluster_mask = np.zeros((self.max_clusters,), dtype=np.float32)
+        padded_agents_per_cluster = np.zeros((self.max_clusters,), dtype=np.int32)
+        true_agent_cluster_ids = np.array([], dtype=int)  # Empty IDs for dummy data
+        return agents, padded_clusters, cluster_mask, padded_agents_per_cluster, true_agent_cluster_ids
+
+    def __len__(self):
+        return self.ds_size
+
+
+# ============================================
+# CompressedSensingGridDataset class (Modified to return coords and IDs)
+# ============================================
+class CompressedSensingGridDataset(BaseAgentsDataset):
+    """
+    Generates clustered agent data, applies compressed sensing, and returns:
+    Y˜, targets [cx, cy, w], mask, raw_agent_coords, true_agent_cluster_ids
+    """
+
+    def __init__(
+            self,
+            agents_num: int,
+            grid_size: int,
+            m: int,  # Number of measurements (rows in Phi)
+            dim: int = 2,
+            min_clusters: int = 1,
+            max_clusters: int = 5,
+            min_distance: float = 0.15,
+            bounds: tuple = ((0.0, 0.0), (1.0, 1.0)),
+            cluster_std_dev_range: tuple = (0.01, 0.05),
+            ds_size: int = 100000,
+            sensing_matrix_type: str = 'gaussian',
+            sensing_matrix_scale: float = None,
+            device: torch.device = torch.device("cpu")
+    ) -> None:
+        super().__init__(
+            agents_num=agents_num, dim=dim, min_clusters=min_clusters, max_clusters=max_clusters,
+            min_distance=min_distance, bounds=bounds, cluster_std_dev_range=cluster_std_dev_range,
+            ds_size=ds_size,
+        )
+        self.grid_size = grid_size
+        self.s = grid_size * grid_size
+        self.m = m
+        self.device = device  # Device for Phi matrix generation/use
+
+        if self.m > self.s:
+            logging.warning(f"m ({self.m}) > s ({self.s}). No compression.")
+
+        self.phi = self._generate_sensing_matrix(sensing_matrix_type, sensing_matrix_scale)
+        logging.info(f"Initialized CompressedSensingGridDataset: grid={grid_size}x{grid_size} (s={self.s}), m={self.m}")
+        logging.info(f"Sensing matrix Phi shape {self.phi.shape} on device {self.phi.device}")
+
+    def _generate_sensing_matrix(self, matrix_type, scale):
+        """Generates the m x s sensing matrix Phi."""
+        if matrix_type.lower() == 'gaussian':
+            mat = torch.randn(self.m, self.s, dtype=torch.float32, device=self.device)
+        else:
+            raise ValueError(f"Unknown sensing matrix type: {matrix_type}")
+
+        # print chtlytt 1/m
+
+        if scale is None:
+            scale = 1.0 / np.sqrt(self.m)
+            logging.info(f"Using default scaling for Phi: {scale:.4f}")
+        if scale != 0:
+            mat *= scale
+        return mat  # Shape: (m, s)
+
+    def _coords_to_flat_index(self, coords: np.ndarray) -> np.ndarray:
+        """Maps continuous coordinates [0, 1) x [0, 1) to flat grid index [0, s-1]."""
+        scaled_coords = coords * self.grid_size
+        grid_indices = np.floor(scaled_coords).astype(int)
+        grid_indices = np.clip(grid_indices, 0, self.grid_size - 1)
+        flat_indices = grid_indices[:, 1] * self.grid_size + grid_indices[:, 0]
+        return flat_indices.astype(int)  # Shape: (n,)
+
+    def __getitem__(self, index):
+        # 1. Get base agent data (now includes true IDs)
+        agents_coords, padded_clusters, cluster_mask, padded_agents_per_cluster, true_agent_cluster_ids = \
+            super().__getitem__(index)
+
+        n_agents = agents_coords.shape[0]
+        if n_agents == 0:
+            logging.warning(f"Sample {index} has 0 agents.")
+            y_tilde = torch.zeros(self.m, dtype=torch.float32, device='cpu')  # Return on CPU
+            targets = torch.cat([
+                torch.from_numpy(padded_clusters),
+                torch.from_numpy(padded_agents_per_cluster).unsqueeze(1).float()
+            ], dim=1)
+            cluster_mask_tensor = torch.from_numpy(cluster_mask)
+            # Return empty arrays/tensors for consistency
+            return y_tilde, targets, cluster_mask_tensor, agents_coords, true_agent_cluster_ids  # agents_coords/ids are already numpy
+
+        # 2. Create X_sum, X_tilde
+        flat_indices = self._coords_to_flat_index(agents_coords)
+        x_sum_sparse = torch.bincount(torch.from_numpy(flat_indices), minlength=self.s).float()
+
+        # l2_norm = torch.linalg.norm(x_sum_sparse, ord=2)
+
+        # # Normalize by the L2 norm. Add a small epsilon to prevent division by zero
+        # # if x_sum_sparse happens to be all zeros (e.g., if n_agents > 0 but all fall
+        # # outside the grid before clipping, though unlikely with current setup, or if n_agents=0).
+        # epsilon = 1e-8
+        # x_tilde = x_sum_sparse / (l2_norm + epsilon)
+
+        norm_factor = 1.0 / np.sqrt(n_agents) if n_agents > 0 else 0.0
+        x_tilde = x_sum_sparse  * norm_factor
+
+        # 3. Apply Compressed Sensing: Y˜ = Φ @ X˜
+        y_tilde = torch.matmul(self.phi, x_tilde.to(self.phi.device))  # Perform matmul on specified device
+
+        # 4. Prepare Targets & Mask
+        targets = torch.cat([
+            torch.from_numpy(padded_clusters),
+            torch.from_numpy(padded_agents_per_cluster).unsqueeze(1).float()
+        ], dim=1)
+        cluster_mask_tensor = torch.from_numpy(cluster_mask)
+
+        # Return compressed data (on CPU), targets, mask, AND raw coords + true IDs (as numpy)
+        return (
+            y_tilde.cpu(),  # (m,) tensor
+            targets,  # (max_k, 3) tensor [cx, cy, w]
+            cluster_mask_tensor,  # (max_k,) tensor
+            agents_coords,  # (n, 2) numpy array
+            true_agent_cluster_ids  # (n,) numpy array
+        )
+
+    def __len__(self):
+        return self.ds_size
+
+
